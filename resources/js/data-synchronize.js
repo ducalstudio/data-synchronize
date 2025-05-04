@@ -8,7 +8,16 @@ $(() => {
 
         httpClient
             .post($form.prop('action'), data)
-            .then(({ headers, data }) => {
+            .then(async ({ headers, data }) => {
+                if (headers['content-disposition'] === undefined) {
+                    const isJsonBlob = (data) => data instanceof Blob && data.type === "application/json";
+                    const responseData = isJsonBlob(data) ? await (data)?.text() : data || {};
+                    const responseJson = (typeof responseData === "string") ? JSON.parse(responseData) : responseData;
+
+                    Ducal.showError(responseJson?.message || $form.data('error-message'))
+
+                    return
+                }
                 const [_, filename] = headers['content-disposition'].split('filename=')
                 const url = window.URL.createObjectURL(data)
                 const a = document.createElement('a')
@@ -19,19 +28,37 @@ $(() => {
 
                 Ducal.showSuccess($form.data('success-message'))
             })
-            .catch(() => {
-                Ducal.showError($form.data('error-message'))
+            .catch((error) => {
+                Ducal.showError(error.message ? (error.statusText + ': ' + error.message) : form.data('error-message'))
             })
     }
 
     const $form = $(document).find('[data-bb-toggle="import-form"]')
 
     if ($form.length > 0) {
+        const formData = new FormData($form.get(0))
         const $button = $form.find('button[type="submit"]')
         const $errors = $form.find('[data-bb-toggle="import-errors"]')
+        const $failures = $form.find('[data-bb-toggle="import-failures"]')
+        const $failureTemplate = $('#failures-template')
         const $output = $form.find('.data-synchronize-import-output')
         let errors = []
+        let failures = []
         let total = null
+
+        $form.on('change', (e) => {
+            formData.set(e.target.name, e.target.value)
+        })
+
+        const output = (message, type) => {
+            if (type) {
+                $output.append(`<p class="text-${type}">${message}</p>`)
+            } else {
+                $output.append(`<p>${message}</p>`)
+            }
+
+            $output.scrollTop($output[0].scrollHeight)
+        }
 
         const dropzone = new Dropzone($form.find('.dropzone').get(0), {
             url: $form.prop('action'),
@@ -56,35 +83,50 @@ $(() => {
             dropzone.removeAllFiles()
         }
 
-        const importData = (fileName, offset, limit = $form.data('chunk-size'), total = 0) => {
+        const importData = (fileName, offset, limit = parseInt($form.find('input[name=chunk_size]').val()), total = 0) => {
+            formData.set('file_name', fileName)
+            formData.set('offset', offset)
+            formData.set('limit', limit)
+            formData.set('total', total)
+
             $httpClient
                 .make()
-                .post($form.data('import-url'), {
-                    file_name: fileName,
-                    offset,
-                    limit,
-                    total,
-                })
+                .post($form.data('import-url'), formData)
                 .then(({ data }) => {
+                    if (data.data.failures.length > 0) {
+                        failures = failures.concat(data.data.failures)
+                    }
+
                     if (data.data.count > 0) {
-                        $output.append(`<p>${data.message}</p>`)
+                        output(data.message)
                         importData(fileName, data.data.offset + limit, limit, data.data.total)
                     } else {
-                        $output.append(`<p class="text-success">${data.message}</p>`)
+                        output(data.message, 'success')
                         cleanup()
+
+                        if (failures.length > 0) {
+                            $failures.find('tbody').html(
+                                failures.map((failure) => $failureTemplate.html()
+                                    .replace(new RegExp('__index__', 'g'), `#${failure.row}`)
+                                    .replace(new RegExp('__attribute__', 'g'), failure.attribute)
+                                    .replace(new RegExp('__errors__', 'g'), failure.errors.map((error) => `<li>${error}</li>`).join('')))
+                                    .join('')
+                            )
+                            $failures.show()
+                        }
                     }
                 })
                 .catch(() => cleanup())
         }
 
-        const validate = (fileName, offset, limit = $form.data('chunk-size')) => {
+        const validate = (fileName, offset, limit = parseInt($form.find('input[name=chunk_size]').val())) => {
+            formData.set('file_name', fileName)
+            formData.set('offset', offset)
+            formData.set('limit', limit)
+
             $httpClient
                 .make()
-                .post($form.data('validate-url'), {
-                    file_name: fileName,
-                    offset,
-                    limit,
-                })
+                .post($form.data('validate-url'), formData)
                 .then(({ data }) => {
                     if (data.data.errors.length > 0) {
                         errors = errors.concat(data.data.errors)
@@ -94,7 +136,9 @@ $(() => {
                         total = data.data.total
                     }
 
-                    $output.append(`<p>${data.message}</p>`)
+                    if (data.message) {
+                        output(data.message)
+                    }
 
                     if (data.data.count > 0) {
                         validate(data.data.file_name, data.data.offset + limit, limit)
@@ -102,7 +146,7 @@ $(() => {
                         if (errors.length === 0) {
                             importData(data.data.file_name, 0)
                         } else {
-                            $output.append(`<p class="text-danger">${$form.data('validate-failed-message')}</p>`)
+                            output($form.data('validate-failed-message'), 'danger')
                         }
                     }
 
@@ -119,20 +163,22 @@ $(() => {
         dropzone.on('sending', () => {
             $output.empty()
             $output.show()
+            errors = []
+            failures = []
 
-            $output.append(`<p>${$form.data('uploading-message')}</p>`)
+            output($form.data('uploading-message'))
             Ducal.showButtonLoading($button)
         })
 
         dropzone.on('success', (file, { data, error, message }) => {
             if (error) {
-                $output.append(`<p class="text-danger">${message}</p>`)
+                output(message, 'danger')
                 cleanup()
 
                 return
             }
 
-            $output.append(`<p>${message}</p>`)
+            output(message)
             validate(data.file_name, 0)
         })
 

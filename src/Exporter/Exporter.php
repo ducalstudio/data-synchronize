@@ -4,10 +4,12 @@ namespace Ducal\DataSynchronize\Exporter;
 
 use Ducal\Base\Facades\Assets;
 use Ducal\Base\Facades\BaseHelper;
-use Ducal\Base\Facades\PageTitle;
-use Ducal\Base\Http\Responses\BaseHttpResponse;
+use Ducal\DataSynchronize\Concerns\Exporter\HasEmptyState;
 use Ducal\DataSynchronize\Enums\ExportColumnType;
+use Carbon\Carbon;
 use Illuminate\Contracts\View\View;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Str;
 use Maatwebsite\Excel\Concerns\FromCollection;
 use Maatwebsite\Excel\Concerns\ShouldAutoSize;
 use Maatwebsite\Excel\Concerns\WithColumnFormatting;
@@ -22,10 +24,11 @@ use PhpOffice\PhpSpreadsheet\Cell\DataValidation;
 use PhpOffice\PhpSpreadsheet\Shared\Date;
 use PhpOffice\PhpSpreadsheet\Style\NumberFormat;
 use Symfony\Component\HttpFoundation\BinaryFileResponse;
-use Throwable;
 
 abstract class Exporter implements FromCollection, ShouldAutoSize, WithColumnFormatting, WithEvents, WithHeadings, WithMapping
 {
+    use HasEmptyState;
+
     protected ?array $acceptedColumns = [];
 
     protected string $format = Excel::XLSX;
@@ -37,7 +40,12 @@ abstract class Exporter implements FromCollection, ShouldAutoSize, WithColumnFor
      */
     abstract public function columns(): array;
 
-    public function label(): string
+    public function counters(): array
+    {
+        return [];
+    }
+
+    public function getLabel(): string
     {
         return str(static::class)
             ->afterLast('\\')
@@ -51,8 +59,26 @@ abstract class Exporter implements FromCollection, ShouldAutoSize, WithColumnFor
     {
         return trans(
             'packages/data-synchronize::data-synchronize.export.heading',
-            ['label' => $this->label()]
+            ['label' => $this->getLabel()]
         );
+    }
+
+    public function getLayout(): string
+    {
+        return BaseHelper::getAdminMasterLayoutTemplate();
+    }
+
+    /**
+     * @return \Ducal\DataSynchronize\Exporter\ExportCounter[]
+     */
+    public function getCounters(): array
+    {
+        return apply_filters('data_synchronize_exporter_counters', $this->counters(), $this);
+    }
+
+    public function hasDataToExport(): bool
+    {
+        return true;
     }
 
     public function headings(): array
@@ -63,7 +89,7 @@ abstract class Exporter implements FromCollection, ShouldAutoSize, WithColumnFor
     public function map($row): array
     {
         return array_map(function (ExportColumn $column) use ($row) {
-            $value = $row->{$column->getName()};
+            $value = Arr::get((array) $row, $column->getName());
 
             return match ($column->getType()) {
                 ExportColumnType::BOOLEAN => $value ? $column->getTrueValue() : $column->getFalseValue(),
@@ -150,46 +176,47 @@ abstract class Exporter implements FromCollection, ShouldAutoSize, WithColumnFor
 
     public function getExportFileName(): string
     {
-        return str_replace(' ', '-', $this->label());
+        return sprintf(
+            '%s-%s.%s',
+            Str::slug($this->getLabel()),
+            BaseHelper::formatDateTime(Carbon::now(), 'Y-m-d-H-i-s'),
+            $this->format
+        );
     }
 
     public function render(): View
     {
-        PageTitle::setTitle($this->getHeading());
-
         Assets::addScriptsDirectly('vendor/core/packages/data-synchronize/js/data-synchronize.js');
 
-        return view('packages/data-synchronize::export', [
+        return view($this->getView(), [
             'exporter' => $this,
         ]);
     }
 
-    public function export(): BinaryFileResponse|BaseHttpResponse
+    protected function getView(): string
     {
-        try {
-            BaseHelper::maximumExecutionTimeAndMemoryLimit();
+        $view = 'packages/data-synchronize::export';
 
-            $writeType = match ($this->format) {
-                'csv' => Excel::CSV,
-                'xlsx' => Excel::XLSX,
-            };
+        return apply_filters('data_synchronize_exporter_view', $view);
+    }
 
-            $headers = [
-                'Content-Type' => match ($this->format) {
-                    'csv' => 'text/csv',
-                    'xlsx' => 'text/xlsx',
-                },
-            ];
+    public function export(): BinaryFileResponse
+    {
+        BaseHelper::maximumExecutionTimeAndMemoryLimit();
 
-            return ExcelFacade::download($this, "{$this->getExportFileName()}.{$this->format}", $writeType, $headers);
-        } catch (Throwable $e) {
-            BaseHelper::logError($e);
+        $writeType = match ($this->format) {
+            'csv' => Excel::CSV,
+            'xlsx' => Excel::XLSX,
+        };
 
-            return BaseHttpResponse::make()
-                ->setError()
-                ->setCode(400)
-                ->setMessage($e->getMessage());
-        }
+        $headers = [
+            'Content-Type' => match ($this->format) {
+                'csv' => 'text/csv',
+                'xlsx' => 'text/xlsx',
+            },
+        ];
+
+        return ExcelFacade::download($this, $this->getExportFileName(), $writeType, $headers);
     }
 
     public function acceptedColumns(?array $columns): self
@@ -214,7 +241,7 @@ abstract class Exporter implements FromCollection, ShouldAutoSize, WithColumnFor
             ];
         }
 
-        return $requiredColumns;
+        return $columns;
     }
 
     public function format(string $format): self
@@ -242,6 +269,6 @@ abstract class Exporter implements FromCollection, ShouldAutoSize, WithColumnFor
 
     public function allColumnsIsDisabled(): bool
     {
-        return count($this->getAcceptedColumns()) === count($this->columns());
+        return count($this->getAcceptedColumns()) === count(array_filter($this->getAcceptedColumns(), fn (ExportColumn $column) => $column->isDisabled()));
     }
 }

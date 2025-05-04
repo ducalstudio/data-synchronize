@@ -3,21 +3,30 @@
 namespace Ducal\DataSynchronize\Importer;
 
 use Ducal\Base\Facades\Assets;
-use Ducal\Base\Facades\PageTitle;
-use Ducal\DataSynchronize\Exporter\ExportColumn;
-use Ducal\DataSynchronize\Exporter\Exporter;
+use Ducal\Base\Facades\BaseHelper;
+use Ducal\DataSynchronize\Concerns\Importer\HasImportResults;
+use Ducal\DataSynchronize\Contracts\Importer\WithMapping;
+use Ducal\DataSynchronize\DataTransferObjects\ChunkImportResponse;
+use Ducal\DataSynchronize\DataTransferObjects\ChunkValidateResponse;
+use Ducal\DataSynchronize\Exporter\ExampleExporter;
+use Ducal\Media\Facades\RvMedia;
 use Illuminate\Contracts\Filesystem\FileNotFoundException;
 use Illuminate\Contracts\Filesystem\Filesystem;
 use Illuminate\Contracts\View\View;
-use Illuminate\Support\Collection;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\LazyCollection;
+use Illuminate\Support\Str;
 use Spatie\SimpleExcel\SimpleExcelReader;
+use Symfony\Component\HttpFoundation\BinaryFileResponse;
 
 abstract class Importer
 {
-    protected array $acceptedFiles = ['csv', 'xls', 'xlsx'];
+    use HasImportResults;
+
+    protected bool $renderWithoutLayout = false;
 
     abstract public function columns(): array;
 
@@ -25,7 +34,12 @@ abstract class Importer
 
     abstract public function getImportUrl(): string;
 
-    abstract public function array(array $data): int;
+    public function getUploadUrl(): string
+    {
+        return route('data-synchronize.upload');
+    }
+
+    abstract public function handle(array $data): int;
 
     public function getLabel(): string
     {
@@ -34,6 +48,7 @@ abstract class Importer
             ->snake()
             ->replace('_', ' ')
             ->remove('importer')
+            ->trim()
             ->title();
     }
 
@@ -47,6 +62,11 @@ abstract class Importer
         return [];
     }
 
+    public function getLayout(): string
+    {
+        return BaseHelper::getAdminMasterLayoutTemplate();
+    }
+
     public function getColumns(): array
     {
         return apply_filters('data_synchronize_importer_columns', $this->columns());
@@ -57,9 +77,25 @@ abstract class Importer
         return apply_filters('data_synchronize_importer_example', $this->examples());
     }
 
+    public function showRulesCheatSheet(): bool
+    {
+        return ! empty(array_filter($this->getValidationRules()));
+    }
+
     public function getAcceptedFiles(): array
     {
-        return apply_filters('data_synchronize_importer_accepted_files', $this->acceptedFiles);
+        return apply_filters(
+            'data_synchronize_importer_accepted_files',
+            config('packages.data-synchronize.data-synchronize.mime_types')
+        );
+    }
+
+    public function getFileExtensions(): array
+    {
+        return apply_filters(
+            'data_synchronize_importer_file_extensions',
+            config('packages.data-synchronize.data-synchronize.extensions')
+        );
     }
 
     public function chunkSize(): int
@@ -77,6 +113,11 @@ abstract class Importer
         return null;
     }
 
+    public function mergeWithUndefinedColumns(): bool
+    {
+        return false;
+    }
+
     public function getHeading(): string
     {
         return trans(
@@ -85,22 +126,40 @@ abstract class Importer
         );
     }
 
+    public function renderWithoutLayout(): View
+    {
+        $this->renderWithoutLayout = true;
+
+        return $this->render();
+    }
+
     public function render(): View
     {
-        PageTitle::setTitle($this->getHeading());
-
         Assets::addStylesDirectly('vendor/core/packages/data-synchronize/css/data-synchronize.css')
             ->addScriptsDirectly('vendor/core/packages/data-synchronize/js/data-synchronize.js')
             ->addScripts('dropzone')
             ->addStyles('dropzone');
 
-        return view(
-            apply_filters('data_synchronize_importer_view', 'packages/data-synchronize::import'),
-            ['importer' => $this]
-        );
+        return view($this->getView(), ['importer' => $this]);
     }
 
-    public function validate(string $fileName, int $offset = 0, int $limit = 100): array
+    protected function getView(): string
+    {
+        $view = 'packages/data-synchronize::import';
+
+        if ($this->renderWithoutLayout) {
+            $view = 'packages/data-synchronize::partials.importer';
+        }
+
+        return apply_filters('data_synchronize_importer_view', $view);
+    }
+
+    public function headerToSnakeCase(): bool
+    {
+        return true;
+    }
+
+    public function validate(string $fileName, int $offset = 0, int $limit = 100): ChunkValidateResponse
     {
         $rows = $this->transformRows($this->getRowsByOffset($fileName, $offset, $limit));
 
@@ -114,64 +173,56 @@ abstract class Importer
             $errors = array_map(fn ($error) => $error[0], $validator->errors()->toArray());
         }
 
-        $rowsCount = count($rows);
+        $count = count($rows);
 
-        if ($rowsCount === 0) {
+        if ($count === 0) {
             $newFileName = pathinfo($fileName, PATHINFO_FILENAME) . '-' . uniqid() . '.' . pathinfo($fileName, PATHINFO_EXTENSION);
 
-            $this->filesystem()->move("uploads/{$fileName}", "uploads/{$newFileName}");
-        }
+            $storageFolder = config('packages.data-synchronize.data-synchronize.storage.path');
 
-        $from = $offset + 1;
-        $to = $offset + $rowsCount;
-
-        return [
-            'total' => $total,
-            'offset' => $offset,
-            'count' => $rowsCount,
-            'errors' => array_values($errors),
-            'file_name' => $rowsCount === 0 ? $newFileName : $fileName,
-            'message' => $from <= $to ? trans('packages/data-synchronize::data-synchronize.import.validating_message', [
-                'from' => number_format($from),
-                'to' => number_format($to),
-            ]) : null,
-        ];
-    }
-
-    public function import(string $fileName, int $offset = 0, int $limit = 100): array
-    {
-        $rows = $this->getRowsByOffset($fileName, $offset, $limit);
-
-        $rowsCount = count($rows);
-        $from = $offset + 1;
-        $to = $offset + $rowsCount;
-
-        $imported = $this->array($this->transformRows($rows));
-
-        $total = request()->integer('total') + $imported;
-
-        if ($from <= $to) {
-            $message = $this->getImportingMessage($from, $to);
-        } else {
-            if ($total > 0) {
-                $message = $this->getDoneMessage($total);
-            } else {
-                $message = trans('packages/data-synchronize::data-synchronize.import.no_data_message', [
-                    'label' => $this->getLabel(),
-                ]);
+            if ($this->filesystem()->exists("$storageFolder/{$fileName}")) {
+                $this->filesystem()->move("$storageFolder/{$fileName}", "$storageFolder/{$newFileName}");
             }
         }
 
-        if (count($rows) === 0) {
-            $this->filesystem()->delete("uploads/{$fileName}");
+        return new ChunkValidateResponse(
+            offset: $offset,
+            count: $count,
+            total: $total,
+            fileName: $count === 0 ? $newFileName : $fileName,
+            errors: array_values($errors),
+        );
+    }
+
+    public function import(string $fileName, int $offset = 0, int $limit = 100): ChunkImportResponse
+    {
+        $rows = $this->getRowsByOffset($fileName, $offset, $limit);
+        $count = count($rows);
+        $rows = $this->transformRows($rows);
+
+        $rowNumber = 0;
+        $rows = array_filter($rows, function () use (&$rowNumber) {
+            $rowNumber++;
+
+            return ! in_array($rowNumber, $this->failures()->map(fn ($failure) => $failure['row'])->all());
+        });
+
+        $imported = $this->handle($rows);
+
+        if ($count === 0) {
+            $storageFolder = config('packages.data-synchronize.data-synchronize.storage.path');
+
+            if ($this->filesystem()->exists("$storageFolder/$fileName")) {
+                $this->filesystem()->delete("$storageFolder/$fileName");
+            }
         }
 
-        return [
-            'offset' => $offset,
-            'count' => $rowsCount,
-            'message' => $message,
-            'total' => $total,
-        ];
+        return new ChunkImportResponse(
+            offset: $offset,
+            count: $count,
+            imported: $imported,
+            failures: $this->failures()->all()
+        );
     }
 
     public function getImportingMessage(int $from, int $to): string
@@ -186,7 +237,7 @@ abstract class Importer
     {
         return trans('packages/data-synchronize::data-synchronize.import.done_message', [
             'count' => number_format($count),
-            'label' => $this->getLabel(),
+            'label' => strtolower($this->getLabel()),
         ]);
     }
 
@@ -197,14 +248,17 @@ abstract class Importer
 
     public function getRows(string $fileName, int $offset = 0, int $limit = 0): LazyCollection
     {
-        $filePath = sprintf('uploads/%s', $fileName);
+        $filePath = sprintf('%s/%s', config('packages.data-synchronize.data-synchronize.storage.path'), $fileName);
 
         if (! $this->filesystem()->exists($filePath)) {
             throw new FileNotFoundException('File not found at path: ' . $filePath);
         }
 
-        $reader = SimpleExcelReader::create($this->filesystem()->path($filePath))
-            ->headersToSnakeCase();
+        $reader = SimpleExcelReader::create($this->filesystem()->path($filePath));
+
+        if ($this->headerToSnakeCase()) {
+            $reader->headersToSnakeCase();
+        }
 
         if ($offset > 0) {
             $reader->skip($offset);
@@ -219,21 +273,26 @@ abstract class Importer
 
     public function transformRows(array $rows): array
     {
-        return array_map(fn ($row) => collect($this->getColumns())
-            ->mapWithKeys(function (ImportColumn $column) use ($row) {
-                $value = $row[$column->getName()] ?? null;
+        return array_map(function ($row) {
+            $formatted = collect($this->getColumns())
+                ->mapWithKeys(function (ImportColumn $column) use ($row) {
+                    $value = Arr::pull($row, $column->getHeading());
 
-                if ($column->isNullable() && empty($value)) {
-                    return [$column->getName() => null];
-                }
+                    $value = match (true) {
+                        $column->isNullable() && empty($value) => null,
+                        $column->isBoolean() && is_string($value) => $value === $column->getTrueValue() ? 1 : 0,
+                        default => $value,
+                    };
 
-                if ($column->isBoolean() && is_string($value)) {
-                    $value = $value === $column->getTrueValue() ? 1 : 0;
-                }
+                    return [$column->getName() => $value];
+                })
+                ->all();
 
-                return [$column->getName() => $value];
-            })
-            ->all(), $rows);
+            return [
+                ...($this instanceof WithMapping ? $this->map($formatted) : $formatted),
+                ...($this->mergeWithUndefinedColumns() ? $row : []),
+            ];
+        }, $rows);
     }
 
     public function getValidationRules(): array
@@ -247,39 +306,34 @@ abstract class Importer
 
     public function filesystem(): Filesystem
     {
-        return Storage::disk('local');
+        return Storage::disk(config('packages.data-synchronize.data-synchronize.storage.disk'));
     }
 
-    public function downloadExample(string $format)
+    public function downloadExample(string $format): BinaryFileResponse
     {
-        $examples = $this->getExamples();
         $columns = $this->getColumns();
-        $label = $this->getLabel();
-
-        $exporter = new class ($examples, $columns, $label) extends Exporter {
-            public function __construct(protected array $examples, protected array $columns, protected string $label)
-            {
-            }
-
-            public function columns(): array
-            {
-                return array_map(fn (ImportColumn $item) => ExportColumn::make($item->getName())->label($item->getLabel()), $this->columns);
-            }
-
-            public function getExportFileName(): string
-            {
-                return sprintf('%s-example', str($this->label)->trim()->replace(' ', '-'));
-            }
-
-            public function collection(): Collection
-            {
-                return collect($this->examples)->map(fn ($item) => (object) $item);
-            }
-        };
+        $exporter = (new ExampleExporter($this->getExamples(), $columns, $this->getLabel()));
 
         return $exporter
             ->format($format)
             ->acceptedColumns(array_map(fn (ImportColumn $column) => $column->getName(), $columns))
             ->export();
+    }
+
+    protected function resolveMediaImage(string $url, ?string $directory = null): string
+    {
+        if (! Str::startsWith($url, ['http://', 'https://'])) {
+            return $url;
+        }
+
+        $result = RvMedia::uploadFromUrl($url, 0, $directory);
+
+        if ($result['error']) {
+            Log::error($result['message']);
+
+            return $url;
+        }
+
+        return $result['data']->url;
     }
 }
